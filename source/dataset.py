@@ -177,6 +177,13 @@ class DatasetFactory:
                         options.features_dir,
                         options.label_name,
                     )
+                elif agg_method == "self_att_vectorized":
+                    self.dataset = ExtractedFeaturesPatientLevelVectorizedSurvivalDataset(
+                        options.patient_df,
+                        options.slide_df,
+                        options.features_dir,
+                        options.label_name,
+                    )
                 elif not agg_method:
                     self.dataset = ExtractedFeaturesSlideLevelSurvivalDataset(
                         options.slide_df,
@@ -647,3 +654,107 @@ class HierarchicalPretrainingDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.features_list)
+
+
+class ExtractedFeaturesPatientLevelVectorizedSurvivalDataset(
+    ExtractedFeaturesSurvivalDataset
+):
+    def __init__(
+        self,
+        patient_df: pd.DataFrame,
+        slide_df: pd.DataFrame,
+        features_dir: Path,
+        label_name: str = "label",
+        emb_dim: int = 192,
+    ):
+
+        super().__init__(patient_df, slide_df, features_dir, label_name)
+        self.dim = emb_dim
+
+    def __getitem__(self, idx: int):
+
+        row = self.df.loc[idx]
+        case_id = row.case_id
+        slide_ids = self.slide_df[
+            self.slide_df.case_id == case_id
+        ].slide_id.values.tolist()
+
+        assert len(slide_ids) == len(set(slide_ids))
+
+        label = row.disc_label
+        event_time = row[self.label_name]
+        c = row.censorship
+
+        features = []
+        M = 0
+        for i, slide_id in enumerate(slide_ids):
+            fp = Path(self.features_dir, f"{slide_id}.pt")
+            feats = torch.load(fp)
+            if len(feats) > M:
+                M = len(feats)
+            features.append(feats)
+
+        for i, f in enumerate(features):
+            delta_m = M - len(f)
+            t_pad = (0,0,0,delta_m)
+            features[i] = torch.nn.functional.pad(f, t_pad, value=0.).unsqueeze(0)
+
+        features = torch.cat(features, dim=0)
+
+        return idx, features, label, event_time, c
+
+
+class ExtractedFeaturesPatientLevelCoordsVectorizedSurvivalDataset(
+    ExtractedFeaturesCoordsSurvivalDataset
+):
+    def __init__(
+        self,
+        patient_df: pd.DataFrame,
+        slide_df: pd.DataFrame,
+        tiles_df: pd.DataFrame,
+        features_dir: Path,
+        label_name: str = "label",
+        emb_dim: int = 192,
+    ):
+
+        super().__init__(patient_df, slide_df, tiles_df, features_dir, label_name)
+        self.dim = emb_dim
+
+    def __getitem__(self, idx: int):
+
+        row = self.df.loc[idx]
+        case_id = row.case_id
+        slide_ids = self.slide_df[
+            self.slide_df.case_id == case_id
+        ].slide_id.values.tolist()
+
+        assert len(slide_ids) == len(set(slide_ids))
+        N = len(slide_ids)
+
+        label = row.disc_label
+        event_time = row[self.label_name]
+        c = row.censorship
+
+        M = self.tmp[self.tmp.slide_id.isin(slide_ids)].ntile.max()
+        features = torch.empty((N,M,self.dim))
+        coordinates = np.empty((N,M,2))
+        for i, slide_id in enumerate(slide_ids):
+            feats = []
+            coords = self.tiles_df[self.tiles_df.slide_id == slide_id][
+                ["x", "y"]
+            ].values
+            for x, y in coords:
+                fp = Path(self.features_dir, f"{slide_id}_{x}_{y}.pt")
+                f = torch.load(fp)
+                feats.append(f)
+            feats = torch.cat(feats, dim=0)
+            if len(feats) < M:
+                delta_m = M - len(feats)
+                t_pad = (0,0,0,delta_m)
+                feats = torch.nn.functional.pad(feats, t_pad, value=0.)
+                n_pad = ((0,delta_m),(0,0))
+                coords = np.pad(coords, n_pad, mode="constant", constant_values=-1.)
+            features[i] = feats
+            coordinates[i] = coords
+
+        return idx, features, coordinates, label, event_time, c

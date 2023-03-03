@@ -141,6 +141,8 @@ class PositionalEmbedding(nn.Module):
         """
         seq_length = x.shape[0]
         position_ids = self.pos_ids[:seq_length]
+        if x.is_cuda:
+            position_ids = position_ids.cuda()
         position_embeddings = self.embedder(position_ids)
         x += position_embeddings
         return x

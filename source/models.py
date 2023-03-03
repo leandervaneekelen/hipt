@@ -34,6 +34,12 @@ class ModelFactory:
                         dropout=model_options.dropout,
                         slide_pos_embed=model_options.slide_pos_embed,
                     )
+            elif model_options.agg_method == "self_att_vectorized":
+                self.model = GlobalPatientLevelVectorizedHIPT(
+                        num_classes=num_classes,
+                        dropout=model_options.dropout,
+                        slide_pos_embed=model_options.slide_pos_embed,
+                    )
             elif model_options.agg_method == "concat" or not model_options.agg_method:
                 if model_options.slide_pos_embed.type == '2d' and model_options.slide_pos_embed.use:
                     self.model = GlobalCoordsHIPT(
@@ -747,6 +753,7 @@ class GlobalPatientLevelHIPT(nn.Module):
 
         super(GlobalPatientLevelHIPT, self).__init__()
         self.num_classes = num_classes
+        self.embed_dim_slide = embed_dim_slide
         self.slide_pos_embed = slide_pos_embed
 
         # from region to slide aggregation
@@ -831,12 +838,12 @@ class GlobalPatientLevelHIPT(nn.Module):
                 y = self.pos_encoder(y)
             # in nn.TransformerEncoderLayer, batch_first defaults to False
             # hence, input is expected to be of shape (seq_length, batch, emb_size)
-            y = self.global_transformer_slide(y.unsqueeze(1)).squeeze(1)
-            att_slide, y = self.global_attn_pool_slide(y)
-            att_slide = torch.transpose(att_slide, 1, 0)
-            att_slide = F.softmax(att_slide, dim=1)
-            y_att = torch.mm(att_slide, y)
-            y_slide = self.global_rho_slide(y_att)
+            y = self.global_transformer_slide(y.unsqueeze(1)).squeeze(1)    # (seq_length, emb_size)
+            att_slide, y = self.global_attn_pool_slide(y)   # (seq_length, 1), (seq_length, emb_size)
+            att_slide = torch.transpose(att_slide, 1, 0)    # (1, seq_length)
+            att_slide = F.softmax(att_slide, dim=1)         # (1, seq_length)
+            y_att = torch.mm(att_slide, y)                  # (1, emb_size)
+            y_slide = self.global_rho_slide(y_att)          # (1, emb_size)
             slide_seq.append(y_slide)
 
         slide_seq = torch.cat(slide_seq, dim=0)
@@ -969,5 +976,103 @@ class GlobalPatientLevelCoordsHIPT(GlobalPatientLevelHIPT):
         z_patient = self.global_rho_patient(z_att)
 
         logits = self.classifier(z_patient)
+
+        return logits
+
+
+class GlobalPatientLevelVectorizedHIPT(GlobalPatientLevelHIPT):
+    def __init__(
+        self,
+        num_classes: int = 2,
+        embed_dim_region: int = 192,
+        embed_dim_slide: int = 192,
+        embed_dim_patient: int = 192,
+        dropout: float = 0.25,
+        slide_pos_embed: Optional[DictConfig] = None,
+    ):
+
+        super().__init__(num_classes, embed_dim_region, embed_dim_slide, embed_dim_patient, dropout, slide_pos_embed)
+
+    def forward(self, x):
+
+        # x = (N, M, 192)
+        x = self.global_phi_slide(x)    # (N, M, 192)
+        if self.slide_pos_embed.use:
+            x = self.pos_encoder(x) # TODO: take care of pos embedding when batch dim > 1 in both x & coords
+        # in nn.TransformerEncoderLayer, batch_first defaults to False
+        # hence, input is expected to be of shape (seq_length, batch, emb_size)
+        x = self.global_transformer_slide(x.permute(1,0,2)).permute(1,0,2) # (N, M, emb_size)
+        att_slide, x = self.global_attn_pool_slide(x)   # (N, M, 1), (N, M, emb_size)
+        att_slide = torch.transpose(att_slide, 2, 1)    # (N, 1, M)
+        att_slide = F.softmax(att_slide, dim=2)         # (N, 1, M)
+
+        # 2 ways to go
+
+        # ## 1 ##
+        # x_att = torch.mm(att_slide.reshape(1,-1), x.reshape(-1,self.embed_dim_slide))   # (1, emb_size)
+        # x_patient = self.global_rho_slide(x_att)                                        # (1, emb_size)
+
+        ## 2 ##
+        x_att = torch.bmm(att_slide, x).squeeze(1)  # (N, emb_size)
+        slide_seq = self.global_rho_slide(x_att)    # (N, emb_size)
+        z = self.global_phi_patient(slide_seq)      # (N, emb_size)
+        z = self.global_transformer_patient(z.unsqueeze(1)).squeeze(1)  # (N, emb_size)
+        att_patient, z = self.global_attn_pool_patient(z)   # (N, 1), (N, emb_size)
+        att_patient = torch.transpose(att_patient, 1, 0)    # (1, N)
+        att_patient = F.softmax(att_patient, dim=1)         # (1, N)
+        z_att = torch.mm(att_patient, z)                    # (1, emb_size)
+        x_patient = self.global_rho_patient(z_att)          # (1, emb_size)
+
+        logits = self.classifier(x_patient)
+
+        return logits
+
+
+class GlobalPatientLevelCoordsVectorizedHIPT(GlobalPatientLevelCoordsHIPT):
+    def __init__(
+        self,
+        num_classes: int = 2,
+        embed_dim_region: int = 192,
+        embed_dim_slide: int = 192,
+        embed_dim_patient: int = 192,
+        tile_size: int = 4096,
+        dropout: float = 0.25,
+        slide_pos_embed: Optional[DictConfig] = None,
+    ):
+
+        super().__init__(num_classes, embed_dim_region, embed_dim_slide, embed_dim_patient, tile_size, dropout, slide_pos_embed)
+
+    def forward(self, x, coords):
+
+        # x = (N, M, 192)
+        # coords = (N, M, 192)
+        x = self.global_phi_slide(x)    # (N, M, 192)
+        # if self.slide_pos_embed.use:
+        #     x = self.pos_encoder(x, coords) # TODO: take care of pos embedding when batch dim > 1 in both x & coords
+        # in nn.TransformerEncoderLayer, batch_first defaults to False
+        # hence, input is expected to be of shape (seq_length, batch, emb_size)
+        x = self.global_transformer_slide(x.permute(1,0,2)).permute(1,0,2) # (N, M, emb_size)
+        att_slide, x = self.global_attn_pool_slide(x)   # (N, M, 1), (N, M, emb_size)
+        att_slide = torch.transpose(att_slide, 2, 1)    # (N, 1, M)
+        att_slide = F.softmax(att_slide, dim=2)         # (N, 1, M)
+
+        # 2 ways to go
+
+        # ## 1 ##
+        # x_att = torch.mm(att_slide.reshape(1,-1), x.reshape(-1,self.embed_dim_slide))   # (1, emb_size)
+        # x_patient = self.global_rho_slide(x_att)                                        # (1, emb_size)
+
+        ## 2 ##
+        x_att = torch.bmm(att_slide, x).squeeze(1)  # (N, emb_size)
+        slide_seq = self.global_rho_slide(x_att)    # (N, emb_size)
+        z = self.global_phi_patient(slide_seq)      # (N, emb_size)
+        z = self.global_transformer_patient(z.unsqueeze(1)).squeeze(1)  # (N, emb_size)
+        att_patient, z = self.global_attn_pool_patient(z)   # (N, 1), (N, emb_size)
+        att_patient = torch.transpose(att_patient, 1, 0)    # (1, N)
+        att_patient = F.softmax(att_patient, dim=1)         # (1, N)
+        z_att = torch.mm(att_patient, z)                    # (1, emb_size)
+        x_patient = self.global_rho_patient(z_att)          # (1, emb_size)
+
+        logits = self.classifier(x_patient)
 
         return logits

@@ -207,6 +207,25 @@ def collate_survival_features(
     return [idx, feature, label, event_time, censorship]
 
 
+def collate_survival_features_pad(batch, label_type: str = "int"):
+    idx = torch.LongTensor([item[0] for item in batch])
+    M = max([len(item[1]) for item in batch])
+    features = []
+    for item in batch:
+        f = item[1]
+        delta_m = M - len(f)
+        t_pad = (0,0,0,delta_m)
+        features.append(torch.nn.functional.pad(f, t_pad, value=0.))
+    feature = torch.cat(features, dim=0)
+    if label_type == "float":
+        label = torch.FloatTensor([item[2] for item in batch])
+    elif label_type == "int":
+        label = torch.LongTensor([item[2] for item in batch])
+    event_time = torch.FloatTensor([item[3] for item in batch])
+    censorship = torch.FloatTensor([item[4] for item in batch])
+    return [idx, feature, label, event_time, censorship]
+
+
 def collate_survival_features_coords(batch, label_type: str = "int", agg_method: str = "concat"):
     idx = torch.LongTensor([item[0] for item in batch])
     if agg_method == "concat":
@@ -218,6 +237,31 @@ def collate_survival_features_coords(batch, label_type: str = "int", agg_method:
             [torch.LongTensor(item[2][i]) for i in range(len(item[2]))]
             for item in batch
         ]
+    if label_type == "float":
+        label = torch.FloatTensor([item[3] for item in batch])
+    elif label_type == "int":
+        label = torch.LongTensor([item[3] for item in batch])
+    event_time = torch.FloatTensor([item[4] for item in batch])
+    censorship = torch.FloatTensor([item[5] for item in batch])
+    return [idx, feature, coords, label, event_time, censorship]
+
+
+def collate_survival_features_vectorized(batch, label_type: str = "int", agg_method: str = "concat"):
+    idx = torch.LongTensor([item[0] for item in batch])
+    feature = torch.cat([item[1] for item in batch], dim=0)
+    if label_type == "float":
+        label = torch.FloatTensor([item[2] for item in batch])
+    elif label_type == "int":
+        label = torch.LongTensor([item[2] for item in batch])
+    event_time = torch.FloatTensor([item[3] for item in batch])
+    censorship = torch.FloatTensor([item[4] for item in batch])
+    return [idx, feature, label, event_time, censorship]
+
+
+def collate_survival_features_vectorized_coords(batch, label_type: str = "int", agg_method: str = "concat"):
+    idx = torch.LongTensor([item[0] for item in batch])
+    feature = torch.cat([item[1] for item in batch], dim=0)
+    coords = torch.LongTensor(np.array([item[2] for item in batch]))
     if label_type == "float":
         label = torch.FloatTensor([item[3] for item in batch])
     elif label_type == "int":
@@ -731,9 +775,13 @@ def train_survival(
             collate_survival_features_coords, label_type="int", agg_method=agg_method
         )
     else:
-        collate_fn = partial(
-            collate_survival_features, label_type="int", agg_method=agg_method
-        )
+        # collate_fn = partial(
+        #     collate_survival_features_vectorized, label_type="int", agg_method=agg_method
+        # )
+        collate_fn = partial(collate_survival_features_pad, label_type="int")
+        # collate_fn = partial(
+        #     collate_survival_features, label_type="int", agg_method=agg_method
+        # )
 
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -764,6 +812,9 @@ def train_survival(
                 elif agg_method == "self_att":
                     x = [f.to(device, non_blocking=True) for f in x[0]]
                     coords = [c.to(device, non_blocking=True) for c in coords[0]]
+                    # x, coords = x.to(device, non_blocking=True), coords.to(
+                    #         device, non_blocking=True
+                    #     )
             else:
                 idx, x, label, event_time, c = batch
                 if agg_method == "self_att":
@@ -848,9 +899,13 @@ def tune_survival(
             collate_survival_features_coords, label_type="int", agg_method=agg_method
         )
     else:
-        collate_fn = partial(
-            collate_survival_features, label_type="int", agg_method=agg_method
-        )
+        # collate_fn = partial(
+        #     collate_survival_features_vectorized, label_type="int", agg_method=agg_method
+        # )
+        collate_fn = partial(collate_survival_features_pad, label_type="int")
+        # collate_fn = partial(
+        #     collate_survival_features, label_type="int", agg_method=agg_method
+        # )
 
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -883,6 +938,9 @@ def tune_survival(
                     elif agg_method == "self_att":
                         x = [f.to(device, non_blocking=True) for f in x[0]]
                         coords = [c.to(device, non_blocking=True) for c in coords[0]]
+                        # x, coords = x.to(device, non_blocking=True), coords.to(
+                        #     device, non_blocking=True
+                        # )
                 else:
                     idx, x, label, event_time, c = batch
                     if agg_method == "self_att":
@@ -954,9 +1012,13 @@ def test_survival(
             collate_survival_features_coords, label_type="int", agg_method=agg_method
         )
     else:
-        collate_fn = partial(
-            collate_survival_features, label_type="int", agg_method=agg_method
-        )
+        # collate_fn = partial(
+        #     collate_survival_features_vectorized, label_type="int", agg_method=agg_method
+        # )
+        collate_fn = partial(collate_survival_features_pad, label_type="int")
+        # collate_fn = partial(
+        #     collate_survival_features, label_type="int", agg_method=agg_method
+        # )
 
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -989,6 +1051,9 @@ def test_survival(
                     elif agg_method == "self_att":
                         x = [f.to(device, non_blocking=True) for f in x[0]]
                         coords = [c.to(device, non_blocking=True) for c in coords[0]]
+                        # x, coords = x.to(device, non_blocking=True), coords.to(
+                        #     device, non_blocking=True
+                        # )
                 else:
                     idx, x, label, event_time, c = batch
                     if agg_method == "self_att":

@@ -6,14 +6,17 @@ data:
   fold_dir: '/data/pathology/projects/ais-cap/dataset/witali-liver/splits'
   tiles_csv: '/data/pathology/projects/ais-cap/dataset/witali-liver/tiles.csv'
 
-features_dir: 'output/witali-liver/features/2qi92y06/global/region'
+features_dir: 'output/witali-liver/features/2qi92y06/global/slide'
 output_dir: 'output/witali-liver/survival'
-experiment_name: 'concat_pos_embedding_2d'
+experiment_name: 'concat_bs'
 level: 'global'
 
 nepochs: 50
 label_name: 'OS'
 nbins: 4
+
+training:
+  batch_size: 8
 
 testing:
   retrieve_checkpoint: 'best'
@@ -21,12 +24,13 @@ testing:
 model:
   agg_method: 'concat'
   slide_pos_embed:
-    use: True
-    learned: True
-    type: '2d'
-    max_seq_len: 512
-    max_nslide: 21
+    use: False
+    learned: False
+    type: '1d'
+    max_seq_len: 220
+    max_nslide: -1
     tile_size: ${model.region_size}
 
 wandb:
-  enable: True
+  enable:
+    False
