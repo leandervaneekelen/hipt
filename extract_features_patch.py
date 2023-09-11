@@ -14,7 +14,7 @@ from pathlib import Path
 from omegaconf import DictConfig
 from torchvision import transforms
 
-from source.dataset import ImageFolderWithNameDataset
+from source.dataset import ImageFolderWithNameDataset, ResumingSequentialSampler
 from source.models import PatchEmbedder
 from source.utils import (
     initialize_wandb,
@@ -66,6 +66,9 @@ def main(cfg: DictConfig):
         else:
             output_dir.mkdir(parents=True, exist_ok=True)
             features_dir.mkdir(exist_ok=True)
+    progress_file = Path(
+        output_dir, "progress.pt"
+    )  # scalar tensor that counts what dataset indexes have already been sampled
 
     model = PatchEmbedder(
         img_size=cfg.patch_size,
@@ -75,9 +78,11 @@ def main(cfg: DictConfig):
         img_size_pretrained=cfg.img_size_pretrained,
     )
 
-    t = transforms.Compose([
-        transforms.ToTensor(),
-    ])
+    t = transforms.Compose(
+        [
+            transforms.ToTensor(),
+        ]
+    )
     dataset = ImageFolderWithNameDataset(cfg.data_dir, t)
 
     if distributed and is_main_process() and cfg.wandb.enable:
@@ -99,13 +104,15 @@ def main(cfg: DictConfig):
     time.sleep(5)
 
     if distributed:
+        # TODO: Distributed feature extraction has no resume feature
         sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     else:
-        sampler = torch.utils.data.RandomSampler(dataset)
+        n_processed = torch.load(progress_file) if cfg.resume else 0
+        sampler = ResumingSequentialSampler(dataset, start_idx=n_processed)
 
     num_workers = min(mp.cpu_count(), cfg.num_workers)
     if "SLURM_JOB_CPUS_PER_NODE" in os.environ:
-        num_workers = min(num_workers, int(os.environ['SLURM_JOB_CPUS_PER_NODE']))
+        num_workers = min(num_workers, int(os.environ["SLURM_JOB_CPUS_PER_NODE"]))
 
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -132,25 +139,30 @@ def main(cfg: DictConfig):
         desc="Feature Extraction",
         unit=" img",
         ncols=80,
-        position=0,
+        position=n_processed,
         leave=True,
         disable=not (gpu_id in [-1, 0]),
     ) as t1:
         with torch.no_grad():
             for i, batch in enumerate(t1):
-                imgs, fnames = batch
+                imgs, fnames, parents = batch
+
+                # Make parent directories
+                for parent in parents:
+                    Path(features_dir, parent).mkdir(exist_ok=True)
+
                 imgs = imgs.to(device, non_blocking=True)
                 features = model(imgs)
-                for k, f in enumerate(features):
-                    fname = fnames[k]
-                    feature_path = Path(
-                        features_dir, f"{fname}.pt"
-                    )
+                for f, fname, parent in zip(features, fnames, parents):
+                    feature_path = Path(features_dir, parent, f"{fname}.pt")
                     torch.save(f, feature_path)
                     filenames.append(fname)
                     feature_paths.append(feature_path)
-                if cfg.wandb.enable and not distributed:
-                    wandb.log({"processed": i + 1})
+                if not distributed:
+                    n_processed += cfg.batch_size
+                    torch.save(n_processed, progress_file)
+                    if cfg.wandb.enable:
+                        wandb.log({"processed": n_processed})
 
     features_df = pd.DataFrame.from_dict(
         {
@@ -176,9 +188,7 @@ def main(cfg: DictConfig):
                 os.remove(fp)
             features_df = pd.concat(dfs, ignore_index=True)
             features_df = features_df.drop_duplicates()
-            features_df.to_csv(
-                Path(output_dir, f"features.csv"), index=False
-            )
+            features_df.to_csv(Path(output_dir, f"features.csv"), index=False)
 
     if cfg.wandb.enable and is_main_process() and distributed:
         wandb.log({"processed": len(features_df)})

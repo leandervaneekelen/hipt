@@ -5,8 +5,9 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 from pathlib import Path
+from torch.utils.data import SequentialSampler
 from torchvision import transforms, datasets
-from typing import Callable, Dict, Optional, Any
+from typing import Callable, Dict, Iterator, Optional, Any, Sized
 from collections import defaultdict
 from omegaconf import DictConfig
 from dataclasses import dataclass, field
@@ -128,7 +129,7 @@ class SurvivalDatasetOptions:
     tiles_df: pd.DataFrame
     features_dir: Path
     label_name: str
-    transform: Optional[Callable] = None,
+    transform: Optional[Callable] = (None,)
 
 
 class DatasetFactory:
@@ -771,8 +772,18 @@ class ImageFolderWithNameDataset(datasets.ImageFolder):
         """
         path, target = self.samples[idx]
         fname = Path(path).stem
+        parent = str(Path(path).parent).split("/")[-2]  # Get slide name
         sample = self.loader(path)
         if self.transform is not None:
             sample = self.transform(sample)
 
-        return sample, fname
+        return sample, fname, parent
+
+
+class ResumingSequentialSampler(SequentialSampler):
+    def __init__(self, data_source, start_idx=0) -> None:
+        super().__init__(data_source)
+        self.start_index = start_idx
+
+    def __iter__(self):
+        return iter(range(self.start_index, len(self.data_source)))
