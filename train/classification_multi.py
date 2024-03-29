@@ -1,4 +1,5 @@
 import os
+import gc
 import time
 import tqdm
 import wandb
@@ -26,12 +27,15 @@ from source.utils import (
     train,
     train_ordinal,
     train_regression,
+    train_regression_masked,
     tune,
     tune_ordinal,
     tune_regression,
+    tune_regression_masked,
     test,
     test_ordinal,
     test_regression,
+    test_regression_masked,
     compute_time,
     update_log_dict,
     collate_features,
@@ -73,14 +77,20 @@ def main(cfg: DictConfig):
 
     num_workers = min(mp.cpu_count(), cfg.speed.num_workers)
     if "SLURM_JOB_CPUS_PER_NODE" in os.environ:
-        num_workers = min(num_workers, int(os.environ['SLURM_JOB_CPUS_PER_NODE']))
+        num_workers = min(num_workers, int(os.environ["SLURM_JOB_CPUS_PER_NODE"]))
 
     assert (cfg.task != "classification" and cfg.label_encoding != "ordinal") or (
         cfg.task == "classification"
     )
 
+    mask_attn = (cfg.model.mask_attn_patch is True) or (cfg.model.mask_attn_region is True)
+    attention_masks_dir = None
+    if cfg.attention_masks_dir is not None:
+        attention_masks_dir = Path(cfg.attention_masks_dir)
+        assert attention_masks_dir.is_dir(), f"{attention_masks_dir} doesn't exist!"
+
     fold_root_dir = Path(cfg.data.fold_dir)
-    nfold = len([_ for _ in fold_root_dir.glob(f"fold_*")])
+    nfold = len([_ for _ in fold_root_dir.glob("fold_*")])
     print(f"Training on {nfold} folds")
 
     tune_metrics = defaultdict(dict)
@@ -94,8 +104,12 @@ def main(cfg: DictConfig):
         result_dir = Path(result_root_dir, f"fold_{i}")
         result_dir.mkdir(parents=True, exist_ok=True)
 
-        slide_features_dir = Path(features_root_dir, f"fold_{i}/slide_features")
-        region_features_dir = Path(features_root_dir, f"fold_{i}/region_features")
+        if cfg.data.fold_specific_features:
+            slide_features_dir = Path(features_root_dir, f"fold_{i}/slide_features")
+            region_features_dir = Path(features_root_dir, f"fold_{i}/region_features")
+        else:
+            slide_features_dir = Path(features_root_dir, "slide_features")
+            region_features_dir = Path(features_root_dir, "region_features")
 
         print(f"Loading data for fold {i+1}")
         train_df_path = Path(fold_dir, "train.csv")
@@ -143,6 +157,16 @@ def main(cfg: DictConfig):
             label_mapping=cfg.label_mapping,
             label_encoding=cfg.label_encoding,
             transform=transform,
+            mask_attention=mask_attn,
+            region_dir=Path(cfg.region_dir),
+            attention_masks_dir=attention_masks_dir,
+            spacing=cfg.spacing,
+            region_size=cfg.model.region_size,
+            patch_size=cfg.model.patch_size,
+            mini_patch_size=cfg.model.mini_patch_size,
+            backend=cfg.backend,
+            region_format=cfg.region_format,
+            segmentation_parameters=cfg.seg_params,
         )
         tune_dataset_options = ClassificationDatasetOptions(
             df=tune_df,
@@ -150,6 +174,16 @@ def main(cfg: DictConfig):
             label_name=cfg.label_name,
             label_mapping=cfg.label_mapping,
             label_encoding=cfg.label_encoding,
+            mask_attention=mask_attn,
+            region_dir=Path(cfg.region_dir),
+            attention_masks_dir=attention_masks_dir,
+            spacing=cfg.spacing,
+            region_size=cfg.model.region_size,
+            patch_size=cfg.model.patch_size,
+            mini_patch_size=cfg.model.mini_patch_size,
+            backend=cfg.backend,
+            region_format=cfg.region_format,
+            segmentation_parameters=cfg.seg_params,
         )
         if test_df_path.is_file():
             test_dataset_options = ClassificationDatasetOptions(
@@ -158,9 +192,19 @@ def main(cfg: DictConfig):
                 label_name=cfg.label_name,
                 label_mapping=cfg.label_mapping,
                 label_encoding=cfg.label_encoding,
+                mask_attention=mask_attn,
+                region_dir=Path(cfg.region_dir),
+                attention_masks_dir=attention_masks_dir,
+                spacing=cfg.spacing,
+                region_size=cfg.model.region_size,
+                patch_size=cfg.model.patch_size,
+                mini_patch_size=cfg.model.mini_patch_size,
+                backend=cfg.backend,
+                region_format=cfg.region_format,
+                segmentation_parameters=cfg.seg_params,
             )
 
-        print(f"Initializing datasets")
+        print("Initializing datasets")
         train_dataset = DatasetFactory(cfg.task, train_dataset_options).get_dataset()
         tune_dataset = DatasetFactory(cfg.task, tune_dataset_options).get_dataset()
         if test_df_path.is_file():
@@ -210,7 +254,7 @@ def main(cfg: DictConfig):
         with tqdm.tqdm(
             range(cfg.nepochs),
             desc=(f"HIPT Training (fold {i+1}/{nfold})"),
-            unit=" slide",
+            unit=" epoch",
             ncols=100,
             leave=True,
         ) as t:
@@ -224,18 +268,32 @@ def main(cfg: DictConfig):
                     log_dict = {f"train/fold_{i}/epoch": epoch + 1}
 
                 if cfg.task == "regression":
-                    train_results = train_regression(
-                        epoch + 1,
-                        model,
-                        train_dataset,
-                        optimizer,
-                        criterion,
-                        batch_size=cfg.training.batch_size,
-                        weighted_sampling=cfg.training.weighted_sampling,
-                        gradient_accumulation=cfg.training.gradient_accumulation,
-                        num_workers=num_workers,
-                        use_wandb=cfg.wandb.enable,
-                    )
+                    if mask_attn:
+                        train_results = train_regression_masked(
+                            epoch + 1,
+                            model,
+                            train_dataset,
+                            optimizer,
+                            criterion,
+                            batch_size=cfg.training.batch_size,
+                            weighted_sampling=cfg.training.weighted_sampling,
+                            gradient_accumulation=cfg.training.gradient_accumulation,
+                            num_workers=num_workers,
+                            use_wandb=cfg.wandb.enable,
+                        )
+                    else:
+                        train_results = train_regression(
+                            epoch + 1,
+                            model,
+                            train_dataset,
+                            optimizer,
+                            criterion,
+                            batch_size=cfg.training.batch_size,
+                            weighted_sampling=cfg.training.weighted_sampling,
+                            gradient_accumulation=cfg.training.gradient_accumulation,
+                            num_workers=num_workers,
+                            use_wandb=cfg.wandb.enable,
+                        )
                 elif cfg.label_encoding == "ordinal":
                     train_results = train_ordinal(
                         epoch + 1,
@@ -282,15 +340,26 @@ def main(cfg: DictConfig):
 
                 if epoch % cfg.tuning.tune_every == 0:
                     if cfg.task == "regression":
-                        tune_results = tune_regression(
-                            epoch + 1,
-                            model,
-                            tune_dataset,
-                            criterion,
-                            batch_size=cfg.tuning.batch_size,
-                            num_workers=num_workers,
-                            use_wandb=cfg.wandb.enable,
-                        )
+                        if mask_attn:
+                            tune_results = tune_regression_masked(
+                                epoch + 1,
+                                model,
+                                tune_dataset,
+                                criterion,
+                                batch_size=cfg.tuning.batch_size,
+                                num_workers=num_workers,
+                                use_wandb=cfg.wandb.enable,
+                            )
+                        else:
+                            tune_results = tune_regression(
+                                epoch + 1,
+                                model,
+                                tune_dataset,
+                                criterion,
+                                batch_size=cfg.tuning.batch_size,
+                                num_workers=num_workers,
+                                use_wandb=cfg.wandb.enable,
+                            )
                     elif cfg.label_encoding == "ordinal":
                         tune_results = tune_ordinal(
                             epoch + 1,
@@ -370,13 +439,22 @@ def main(cfg: DictConfig):
         model.load_state_dict(best_model_sd)
 
         if cfg.task == "regression":
-            tune_results = test_regression(
-                model,
-                tune_dataset,
-                batch_size=1,
-                num_workers=num_workers,
-                use_wandb=cfg.wandb.enable,
-            )
+            if mask_attn:
+                tune_results = test_regression_masked(
+                    model,
+                    tune_dataset,
+                    batch_size=1,
+                    num_workers=num_workers,
+                    use_wandb=cfg.wandb.enable,
+                )
+            else:
+                tune_results = test_regression(
+                    model,
+                    tune_dataset,
+                    batch_size=1,
+                    num_workers=num_workers,
+                    use_wandb=cfg.wandb.enable,
+                )
         elif cfg.label_encoding == "ordinal":
             tune_results = test_ordinal(
                 model,
@@ -427,13 +505,22 @@ def main(cfg: DictConfig):
 
         if test_df_path.is_file():
             if cfg.task == "regression":
-                test_results = test_regression(
-                    model,
-                    test_dataset,
-                    batch_size=1,
-                    num_workers=num_workers,
-                    use_wandb=cfg.wandb.enable,
-                )
+                if mask_attn:
+                    test_results = test_regression_masked(
+                        model,
+                        test_dataset,
+                        batch_size=1,
+                        num_workers=num_workers,
+                        use_wandb=cfg.wandb.enable,
+                    )
+                else:
+                    test_results = test_regression(
+                        model,
+                        test_dataset,
+                        batch_size=1,
+                        num_workers=num_workers,
+                        use_wandb=cfg.wandb.enable,
+                    )
             elif cfg.label_encoding == "ordinal":
                 test_results = test_ordinal(
                     model,
@@ -469,6 +556,18 @@ def main(cfg: DictConfig):
                         wandb.log({f"test/fold_{i}/{r}": v})
                 elif "cm" not in r:
                     print(f"test {r}: {v}")
+
+        # freeing up memory at the end of each fold
+        del model, train_dataset, tune_dataset, optimizer, scheduler, criterion
+        if test_df_path.is_file():
+            del test_dataset
+
+        # clear PyTorch's cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # explicitly calling garbage collection
+        gc.collect()
 
     metrics = defaultdict(list)
     for _, metric_dict in tune_metrics.items():
@@ -524,6 +623,7 @@ def main(cfg: DictConfig):
 if __name__ == "__main__":
 
     import torch.multiprocessing
+
     torch.multiprocessing.set_sharing_strategy("file_system")
 
     main()

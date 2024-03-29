@@ -20,6 +20,7 @@ from source.utils import (
     initialize_wandb,
     is_main_process,
 )
+from pretrain.utils import make_classification_eval_transform
 
 
 @hydra.main(
@@ -78,12 +79,8 @@ def main(cfg: DictConfig):
         img_size_pretrained=cfg.img_size_pretrained,
     )
 
-    t = transforms.Compose(
-        [
-            transforms.ToTensor(),
-        ]
-    )
-    dataset = ImageFolderWithNameDataset(cfg.data_dir, t)
+    transform = make_classification_eval_transform()
+    dataset = ImageFolderWithNameDataset(cfg.data_dir, transform)
 
     if distributed and is_main_process() and cfg.wandb.enable:
         command_line = [
@@ -124,7 +121,7 @@ def main(cfg: DictConfig):
     )
 
     if gpu_id == -1:
-        device = torch.device(f"cuda")
+        device = torch.device("cuda")
     else:
         device = torch.device(f"cuda:{gpu_id}")
     model = model.to(device, non_blocking=True)
@@ -139,6 +136,7 @@ def main(cfg: DictConfig):
         desc="Feature Extraction",
         unit=" img",
         ncols=80,
+        unit_scale=cfg.batch_size,
         position=n_processed,
         leave=True,
         disable=not (gpu_id in [-1, 0]),
